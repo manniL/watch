@@ -1,6 +1,6 @@
 // ported from https://github.com/vuejs/vue-next/blob/master/packages/runtime-core/src/apiWatch.ts by Evan You
 
-import { ComputedRef, effect, Ref, ReactiveEffectOptions, isReactive, isRef, stop } from '@vue/reactivity'
+import { ComputedRef, effect, Ref, ReactiveEffectOptions, isReactive, isRef, stop, EffectScheduler, isShallow, ReactiveEffect } from '@vue/reactivity'
 import { hasChanged, isArray, isFunction, isObject, NOOP } from '@vue/shared'
 import { warn, callWithErrorHandling, callWithAsyncErrorHandling } from './errorHandling'
 
@@ -15,6 +15,8 @@ export type WatchCallback<V = any, OV = any> = (
 ) => any
 
 export type WatchStopHandle = () => void
+
+type OnCleanup = (cleanupFn: () => void) => void
 
 type MapSources<T> = {
   [K in keyof T]: T[K] extends WatchSource<infer V>
@@ -31,7 +33,6 @@ type MapOldSources<T, Immediate> = {
 }
 
 type InvalidateCbRegistrator = (cb: () => void) => void
-const invoke = (fn: Function) => fn()
 const INITIAL_WATCHER_VALUE = {}
 
 export interface WatchOptionsBase {
@@ -46,6 +47,28 @@ export interface WatchOptionsBase {
 export interface WatchOptions<Immediate = boolean> extends WatchOptionsBase {
   immediate?: Immediate
   deep?: boolean
+}
+
+interface SchedulerJob extends Function {
+  id?: number
+  active?: boolean
+  computed?: boolean
+  /**
+   * Indicates whether the effect is allowed to recursively trigger itself
+   * when managed by the scheduler.
+   *
+   * By default, a job cannot trigger itself because some built-in method calls,
+   * e.g. Array.prototype.push actually performs reads as well (#1740) which
+   * can lead to confusing infinite loops.
+   * The allowed cases are component update functions and watch callbacks.
+   * Component update functions may update child component props, which in turn
+   * trigger flush: "pre" watch callbacks that mutates state that the parent
+   * relies on (#1801). Watch callbacks doesn't track its dependencies so if it
+   * triggers itself again, it's likely intentional and it is the user's
+   * responsibility to perform recursive state mutation that eventually
+   * stabilizes (#1727).
+   */
+  allowRecurse?: boolean
 }
 
 // Simple effect.
@@ -96,53 +119,54 @@ export function watch<T = any>(
 }
 
 function doWatch(
-  source: WatchSource | WatchSource[] | WatchEffect,
+  source: WatchSource | WatchSource[] | WatchEffect | object,
   cb: WatchCallback | null,
-  { immediate, deep, onTrack, onTrigger }: WatchOptions = {},
+  { immediate, deep, flush, onTrack, onTrigger }: WatchOptions = {}
 ): WatchStopHandle {
   let getter: () => any
-  if (isArray(source) && !isReactive(source)) {
-    getter = () =>
-      // eslint-disable-next-line array-callback-return
-      source.map((s) => {
-        if (isRef(s))
-          return s.value
-        else if (isReactive(s))
-          return traverse(s)
-        else if (isFunction(s))
-          return callWithErrorHandling(s, 'watch getter')
-        else
-          warn('invalid source')
-      })
-  }
-  else if (isRef(source)) {
+  let forceTrigger = false
+  let isMultiSource = false
+
+  if (isRef(source)) {
     getter = () => source.value
-  }
-  else if (isReactive(source)) {
+    forceTrigger = isShallow(source)
+  } else if (isReactive(source)) {
     getter = () => source
     deep = true
-  }
-  else if (isFunction(source)) {
+  } else if (isArray(source)) {
+    isMultiSource = true
+    forceTrigger = source.some(isReactive)
+    getter = () =>
+      source.map(s => {
+        if (isRef(s)) {
+          return s.value
+        } else if (isReactive(s)) {
+          return traverse(s)
+        } else if (isFunction(s)) {
+          return callWithErrorHandling(s, 'watch getter')
+        } else {
+          warn('invalid source')
+        }
+      })
+  } else if (isFunction(source)) {
     if (cb) {
       // getter with cb
       getter = () =>
         callWithErrorHandling(source, 'watch getter')
-    }
-    else {
+    } else {
       // no cb -> simple effect
       getter = () => {
-        if (cleanup)
+        if (cleanup) {
           cleanup()
-
-        return callWithErrorHandling(
+        }
+        return callWithAsyncErrorHandling(
           source,
           'watch callback',
-          [onInvalidate],
+          [onCleanup]
         )
       }
     }
-  }
-  else {
+  } else {
     getter = NOOP
   }
 
@@ -152,58 +176,75 @@ function doWatch(
   }
 
   let cleanup: () => void
-  const onInvalidate: InvalidateCbRegistrator = (fn: () => void) => {
-    cleanup = runner.options.onStop = () => {
+  let onCleanup: OnCleanup = (fn: () => void) => {
+    cleanup = effect.onStop = () => {
       callWithErrorHandling(fn, 'watch cleanup')
     }
   }
 
-  let oldValue = isArray(source) ? [] : INITIAL_WATCHER_VALUE
-  const applyCb = cb
-    ? () => {
-      const newValue = runner()
-      if (deep || hasChanged(newValue, oldValue)) {
+  let oldValue = isMultiSource ? [] : INITIAL_WATCHER_VALUE
+  const job: SchedulerJob = () => {
+    if (!effect.active) {
+      return
+    }
+    if (cb) {
+      // watch(source, cb)
+      const newValue = effect.run()
+      if (
+        deep ||
+        forceTrigger ||
+        (isMultiSource
+          ? (newValue as any[]).some((v, i) =>
+              hasChanged(v, (oldValue as any[])[i])
+            )
+          : hasChanged(newValue, oldValue))
+      ) {
         // cleanup before running cb again
-        if (cleanup)
+        if (cleanup) {
           cleanup()
-
-        callWithAsyncErrorHandling(cb, 'watch callback', [
+        }
+        callWithAsyncErrorHandling(cb, 'watch value', [
           newValue,
           // pass undefined as the old value when it's changed for the first time
           oldValue === INITIAL_WATCHER_VALUE ? undefined : oldValue,
-          onInvalidate,
+          onCleanup
         ])
         oldValue = newValue
       }
+    } else {
+      // watchEffect
+      effect.run()
     }
-    : undefined
+  }
 
-  const scheduler = invoke
+  // important: mark the job as a watcher callback so that scheduler knows
+  // it is allowed to self-trigger (#1727)
+  job.allowRecurse = !!cb
 
-  const runner = effect(getter, {
-    lazy: true,
-    onTrack,
-    onTrigger,
-    scheduler: applyCb ? () => scheduler(applyCb) : scheduler,
-  })
+  let scheduler: EffectScheduler
+  if (flush === 'sync') {
+    scheduler = job as any // the scheduler function gets called directly
+  } else {
+    // default: 'pre'
+    scheduler = () => {
+      job()
+    }
+  }
 
+  const effect = new ReactiveEffect(getter, scheduler)
+  
   // initial run
-  if (applyCb) {
-    if (immediate)
-      applyCb()
+  if (cb) {
+    if (immediate) {
+      job()
+    } else {
+      oldValue = effect.run()
+    }
+  } else {
+    effect.run()
+  }
 
-    else
-      oldValue = runner()
-  }
-  else {
-    runner()
-  }
-
-  const stopWatcher = function() {
-    stop(runner)
-  }
-  stopWatcher.effect = runner
-  return stopWatcher
+  return () => effect.stop()
 }
 
 function traverse(value: unknown, seen: Set<unknown> = new Set()) {
