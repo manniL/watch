@@ -1,8 +1,9 @@
 // ported from https://github.com/vuejs/vue-next/blob/master/packages/runtime-core/src/apiWatch.ts by Evan You
 
-import { ComputedRef, effect, Ref, ReactiveEffectOptions, isReactive, isRef, stop, EffectScheduler, isShallow, ReactiveEffect } from '@vue/reactivity'
-import { hasChanged, isArray, isFunction, isObject, NOOP } from '@vue/shared'
-import { warn, callWithErrorHandling, callWithAsyncErrorHandling } from './errorHandling'
+import type { ComputedRef, EffectScheduler, ReactiveEffectOptions, Ref } from '@vue/reactivity'
+import { ReactiveEffect, isReactive, isRef, isShallow } from '@vue/reactivity'
+import { NOOP, hasChanged, isArray, isFunction, isObject } from '@vue/shared'
+import { callWithAsyncErrorHandling, callWithErrorHandling, warn } from './errorHandling'
 
 export type WatchEffect = (onInvalidate: InvalidateCbRegistrator) => void
 
@@ -85,7 +86,7 @@ export function watchEffect(
 // of all possible value types.
 export function watch<
   T extends Readonly<Array<WatchSource<unknown> | object>>,
-  Immediate extends Readonly<boolean> = false
+  Immediate extends Readonly<boolean> = false,
 >(
   sources: T,
   cb: WatchCallback<MapSources<T>, MapOldSources<T, Immediate>>,
@@ -102,7 +103,7 @@ export function watch<T, Immediate extends Readonly<boolean> = false>(
 // overload #3: watching reactive object w/ cb
 export function watch<
   T extends object,
-  Immediate extends Readonly<boolean> = false
+  Immediate extends Readonly<boolean> = false,
 >(
   source: T,
   cb: WatchCallback<T, Immediate extends true ? (T | undefined) : T>,
@@ -121,7 +122,7 @@ export function watch<T = any>(
 function doWatch(
   source: WatchSource | WatchSource[] | WatchEffect | object,
   cb: WatchCallback | null,
-  { immediate, deep, flush, onTrack, onTrigger }: WatchOptions = {}
+  { immediate, deep, flush }: WatchOptions = {},
 ): WatchStopHandle {
   let getter: () => any
   let forceTrigger = false
@@ -130,43 +131,50 @@ function doWatch(
   if (isRef(source)) {
     getter = () => source.value
     forceTrigger = isShallow(source)
-  } else if (isReactive(source)) {
+  }
+  else if (isReactive(source)) {
     getter = () => source
     deep = true
-  } else if (isArray(source)) {
+  }
+  else if (isArray(source)) {
     isMultiSource = true
     forceTrigger = source.some(isReactive)
     getter = () =>
-      source.map(s => {
-        if (isRef(s)) {
+      source.map((s) => {
+        if (isRef(s))
           return s.value
-        } else if (isReactive(s)) {
+
+        else if (isReactive(s))
           return traverse(s)
-        } else if (isFunction(s)) {
+
+        else if (isFunction(s))
           return callWithErrorHandling(s, 'watch getter')
-        } else {
-          warn('invalid source')
-        }
+
+        else
+          return warn('invalid source')
       })
-  } else if (isFunction(source)) {
+  }
+  else if (isFunction(source)) {
     if (cb) {
       // getter with cb
       getter = () =>
         callWithErrorHandling(source, 'watch getter')
-    } else {
+    }
+    else {
       // no cb -> simple effect
       getter = () => {
-        if (cleanup) {
+        if (cleanup)
           cleanup()
-        }
+
         return callWithAsyncErrorHandling(
           source,
           'watch callback',
-          [onCleanup]
+          [onCleanup],
         )
       }
     }
-  } else {
+  }
+  else {
     getter = NOOP
   }
 
@@ -184,34 +192,35 @@ function doWatch(
 
   let oldValue = isMultiSource ? [] : INITIAL_WATCHER_VALUE
   const job: SchedulerJob = () => {
-    if (!effect.active) {
+    if (!effect.active)
       return
-    }
+
     if (cb) {
       // watch(source, cb)
       const newValue = effect.run()
       if (
-        deep ||
-        forceTrigger ||
-        (isMultiSource
+        deep
+        || forceTrigger
+        || (isMultiSource
           ? (newValue as any[]).some((v, i) =>
-              hasChanged(v, (oldValue as any[])[i])
-            )
+            hasChanged(v, (oldValue as any[])[i]),
+          )
           : hasChanged(newValue, oldValue))
       ) {
         // cleanup before running cb again
-        if (cleanup) {
+        if (cleanup)
           cleanup()
-        }
+
         callWithAsyncErrorHandling(cb, 'watch value', [
           newValue,
           // pass undefined as the old value when it's changed for the first time
           oldValue === INITIAL_WATCHER_VALUE ? undefined : oldValue,
-          onCleanup
+          onCleanup,
         ])
         oldValue = newValue
       }
-    } else {
+    }
+    else {
       // watchEffect
       effect.run()
     }
@@ -224,7 +233,8 @@ function doWatch(
   let scheduler: EffectScheduler
   if (flush === 'sync') {
     scheduler = job as any // the scheduler function gets called directly
-  } else {
+  }
+  else {
     // default: 'pre'
     scheduler = () => {
       job()
@@ -232,15 +242,16 @@ function doWatch(
   }
 
   const effect = new ReactiveEffect(getter, scheduler)
-  
+
   // initial run
   if (cb) {
-    if (immediate) {
+    if (immediate)
       job()
-    } else {
+
+    else
       oldValue = effect.run()
-    }
-  } else {
+  }
+  else {
     effect.run()
   }
 

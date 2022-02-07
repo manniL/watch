@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "@antfu/eslint-config-ts": "^0.16.1",
-    "@types/node": "^17.0.13",
+    "@types/node": "^17.0.15",
     "@vue/reactivity": "^3.2.29",
     "@vue/shared": "^3.2.29",
     "ava": "^4.0.1",
@@ -35,7 +35,7 @@
     "esbuild-register": "^3.3.2",
     "eslint": "^8.8.0",
     "esm": "^3.2.25",
-    "tsup": "^5.11.11",
+    "tsup": "^5.11.13",
     "typescript": "^4.5.5"
   },
   "ava": {
@@ -48,6 +48,6 @@
     ]
   },
   "dependencies": {
-    "esbuild": "^0.14.14"
+    "esbuild": "^0.14.19"
   }
 }
